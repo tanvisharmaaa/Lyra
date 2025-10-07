@@ -1,5 +1,5 @@
-import Papa from 'papaparse';
 import { Dataset } from '@/store/state';
+import Papa from 'papaparse';
 
 export interface ParseResult {
   success: boolean;
@@ -55,7 +55,7 @@ export function parseCSVText(
       };
     }
 
-    const data = result.data as Record<string, any>[];
+    const data = result.data as Record<string, string | number>[];
 
     if (data.length === 0) {
       return {
@@ -102,7 +102,7 @@ export function parseCSVText(
  * Infer whether the target column is for classification or regression
  */
 function inferTargetType(
-  data: Record<string, any>[],
+  data: Record<string, string | number>[],
   targetColumn: string
 ): 'classification' | 'regression' {
   const values = data
@@ -132,7 +132,10 @@ function inferTargetType(
 /**
  * Get unique values from a column
  */
-function getUniqueValues(data: Record<string, any>[], column: string): any[] {
+function getUniqueValues(
+  data: Record<string, string | number>[],
+  column: string
+): (string | number)[] {
   const values = data
     .map(row => row[column])
     .filter(val => val !== null && val !== undefined && val !== '');

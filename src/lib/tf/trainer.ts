@@ -1,5 +1,5 @@
-import * as tf from '@tensorflow/tfjs';
 import { ModelConfig } from '@/store/state';
+import * as tf from '@tensorflow/tfjs';
 
 export interface TrainingProgress {
   epoch: number;
@@ -45,12 +45,31 @@ export async function trainModel(
     } = options;
 
     // Prepare validation data
-    const validationData = xVal && yVal ? [xVal, yVal] : undefined;
+    const validationData: [tf.Tensor, tf.Tensor] | undefined =
+      xVal && yVal ? [xVal, yVal] : undefined;
 
     // Training callbacks
     const callbacks: tf.Callback[] = [];
 
     // Progress callback
+    if (onProgress) {
+      callbacks.push(
+        tf.callbacks.earlyStopping({
+          monitor: 'loss',
+          patience: 10,
+          restoreBestWeights: true,
+        })
+      );
+    }
+
+    // Custom epoch end callback
+    if (onEpochEnd) {
+      callbacks.push({
+        onEpochEnd,
+      } as tf.Callback);
+    }
+
+    // Progress tracking callback
     if (onProgress) {
       callbacks.push({
         onEpochEnd: async (epoch: number, logs: tf.Logs) => {
@@ -63,14 +82,7 @@ export async function trainModel(
           };
           onProgress(progress);
         },
-      });
-    }
-
-    // Custom epoch end callback
-    if (onEpochEnd) {
-      callbacks.push({
-        onEpochEnd,
-      });
+      } as tf.Callback);
     }
 
     // Train the model

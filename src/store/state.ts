@@ -3,7 +3,7 @@ import { devtools } from 'zustand/middleware';
 
 // Types
 export interface Dataset {
-  data: any[];
+  data: Record<string, string | number>[];
   features: string[];
   target: string;
   targetType: 'classification' | 'regression';

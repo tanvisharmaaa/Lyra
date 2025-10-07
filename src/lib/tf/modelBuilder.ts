@@ -1,5 +1,5 @@
-import * as tf from '@tensorflow/tfjs';
 import { ModelConfig } from '@/store/state';
+import * as tf from '@tensorflow/tfjs';
 
 export interface ModelBuilderOptions {
   inputShape: number[];
@@ -86,10 +86,11 @@ export function getModelSummary(model: tf.Sequential): {
   }));
 
   const totalParams = layers.reduce((sum, layer) => sum + layer.params, 0);
-  const trainableParams = model.trainableWeights.reduce(
-    (sum, weight) => sum + weight.size,
-    0
-  );
+  const trainableParams = model.trainableWeights.reduce((sum, weight) => {
+    const shape = weight.shape;
+    if (!shape) return sum;
+    return sum + (shape as number[]).reduce((a, b) => a * b, 1);
+  }, 0);
 
   return {
     totalParams,
@@ -143,7 +144,7 @@ export function getLayerWeights(model: tf.Sequential): Array<{
       layerIndex: index,
       layerName: layer.name,
       weights: weights[0], // Weight matrix
-      biases: weights[1] || tf.zeros([weights[0].shape[1]]), // Bias vector
+      biases: weights[1] || tf.zeros([weights[0].shape[1] || 1]), // Bias vector
     };
   });
 }
