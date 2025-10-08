@@ -181,7 +181,7 @@ export function useIngestion(
     let rows = base.data.data; // raw rows
     const target = base.data.target;
     const features = base.data.features;
-    // Determine effective strategy per feature column (ignore target for now except drop-row effect)
+    // Determine effective strategy per feature column
     const effective: Record<
       string,
       ColumnMissingStrategy | SimpleMissingStrategy
@@ -191,7 +191,15 @@ export function useIngestion(
       effective[col] =
         ov !== undefined ? ov : config.globalStrategy || 'leave-as-is';
     });
-    // Placeholder normalization (if enabled) unify placeholder tokens to ''
+    // Target may also have an override even if not a feature
+    const targetOverride = config.targetColumn
+      ? config.columnStrategies?.[config.targetColumn]
+      : undefined;
+    const effectiveTargetStrategy:
+      | SimpleMissingStrategy
+      | ColumnMissingStrategy
+      | undefined = targetOverride || config.globalStrategy;
+    // Placeholder + whitespace normalization (always applied now)
     const PLACEHOLDERS = new Set([
       'na',
       'n/a',
@@ -205,36 +213,40 @@ export function useIngestion(
       'unknown',
       '.',
     ]);
-    if (config.treatPlaceholdersAsMissing) {
-      rows = rows.map(r => {
-        const nr = { ...r };
-        features.forEach(c => {
-          const v = nr[c];
-          if (v !== undefined && v !== null && v !== '') {
-            const norm = v.toString().trim().toLowerCase();
-            if (PLACEHOLDERS.has(norm)) nr[c] = '';
-          }
-        });
-        if (
-          target &&
-          r[target] !== undefined &&
-          r[target] !== null &&
-          r[target] !== ''
-        ) {
-          const norm = r[target].toString().trim().toLowerCase();
-          if (PLACEHOLDERS.has(norm)) {
-            (nr as Record<string, string | number>)[target] = '';
-          }
+    rows = rows.map(r => {
+      const nr = { ...r } as Record<string, string | number>;
+      const allCols = new Set<string>([...features]);
+      if (target) allCols.add(target);
+      allCols.forEach(c => {
+        const raw = nr[c];
+        if (raw === null || raw === undefined) return;
+        const str = raw.toString();
+        const trimmedLower = str.trim().toLowerCase();
+        if (trimmedLower === '' || PLACEHOLDERS.has(trimmedLower)) {
+          nr[c] = '';
         }
-        return nr;
       });
-    }
-    // Collect columns that trigger drop-row
+      return nr;
+    });
+    // Collect feature columns that trigger drop-row
     const dropCols = features.filter(c => {
       const s = effective[c];
       const t = typeof s === 'string' ? s : s.type;
       return t === 'drop-row';
     });
+    const globalDrop = config.globalStrategy === 'drop-row';
+    const targetDrop = (() => {
+      if (!target) return false;
+      if (globalDrop) return true;
+      if (effectiveTargetStrategy) {
+        const ttype =
+          typeof effectiveTargetStrategy === 'string'
+            ? effectiveTargetStrategy
+            : effectiveTargetStrategy.type;
+        return ttype === 'drop-row';
+      }
+      return dropCols.length > 0; // fallback: if any feature dropping rows, also enforce target cleanliness
+    })();
     // Compute replacement values for each column requiring imputation
     const replacements: Record<string, string | number> = {};
     features.forEach(col => {
@@ -290,15 +302,23 @@ export function useIngestion(
             : sorted[mid];
       }
     });
-    // Apply row dropping (union logic) first so we don't waste time imputing dropped rows
-    if (dropCols.length) {
+    // Apply row dropping (union across dropCols; if globalDrop then any feature missing OR (if targetDrop) target missing)
+    const originalRowCount = rows.length;
+    if (globalDrop || dropCols.length || targetDrop) {
       rows = rows.filter(r => {
-        return dropCols.every(c => {
+        const featureMissing = (globalDrop ? features : dropCols).some(c => {
           const val = r[c];
-          return !(val === '' || val === null || val === undefined);
+          return val === '' || val === null || val === undefined;
         });
+        if (featureMissing) return false;
+        if (targetDrop && target) {
+          const tv = (r as Record<string, string | number>)[target];
+          if (tv === '' || tv === null || tv === undefined) return false;
+        }
+        return true;
       });
     }
+    const droppedRowCount = originalRowCount - rows.length;
     // Apply imputations
     rows = rows.map((r: Record<string, string | number>) => {
       const nr: Record<string, string | number> = { ...r };
@@ -343,6 +363,15 @@ export function useIngestion(
       );
       dataset.numClasses = uniq.size;
     }
+    // Attach summary (non-breaking metadata cast)
+    (dataset as any).imputationSummary = {
+      originalRowCount,
+      droppedRowCount,
+      dropApplied: globalDrop || dropCols.length > 0 || targetDrop,
+      dropColumns: dropCols,
+      globalDrop,
+      targetDrop,
+    };
     return { dataset };
   }, [rawText, config]);
 
