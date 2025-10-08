@@ -2,6 +2,7 @@
   "name": "lyra-neural-viz",
   "version": "0.1.0",
   "private": true,
+  "author": "Tushar Kendre, Tanvi Sharma",
   "scripts": {
     "dev": "next dev --turbopack",
     "build": "next build --turbopack",
