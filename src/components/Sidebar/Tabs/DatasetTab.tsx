@@ -4,20 +4,29 @@ import { CSVPreviewModal } from '@/components/DatasetUpload/CSVPreviewModal';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
-import { parseCSVFile } from '@/lib/data/parser';
+import { useIngestion } from '@/lib/data/useIngestion';
 import { useNeuralNetworkStore } from '@/store/state';
 import { Upload } from 'lucide-react';
-import Papa from 'papaparse';
 import { useState } from 'react';
+import { DATA_LIMITS } from '@/lib/config/appConfig';
 
 export function DatasetTab() {
   const { dataset, setDataset } = useNeuralNetworkStore();
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [previewModalOpen, setPreviewModalOpen] = useState(false);
-  const [previewData, setPreviewData] = useState<
-    Record<string, string | number>[]
-  >([]);
+  const {
+    state,
+    loadRawText,
+    updateConfig,
+    setTarget,
+    toggleFeature,
+    setGlobalStrategy,
+    setColumnStrategy,
+    setColumnConstant,
+    finalize,
+    reset,
+  } = useIngestion();
   const [selectedFile, setSelectedFile] = useState<File | null>(null);
 
   const handleFileUpload = async (
@@ -26,82 +35,47 @@ export function DatasetTab() {
     const file = event.target.files?.[0];
     if (!file) return;
 
+    if (file.size > DATA_LIMITS.maxFileBytes) {
+      setError(
+        `File size ${(file.size / 1024 / 1024).toFixed(2)}MB exceeds limit ${(DATA_LIMITS.maxFileBytes / 1024 / 1024).toFixed(0)}MB`
+      );
+      return;
+    }
     setError(null);
     setSelectedFile(file);
 
     try {
-      // Parse CSV for preview (first 50 rows)
       const text = await file.text();
-      const result = Papa.parse(text, {
-        header: true,
-        skipEmptyLines: true,
-        preview: 50, // Only parse first 50 rows for preview
-      });
-
-      if (result.errors.length > 0) {
-        setError(
-          `CSV parsing errors: ${result.errors.map(e => e.message).join(', ')}`
-        );
-        return;
-      }
-
-      const data = result.data as Record<string, string | number>[];
-      if (data.length === 0) {
-        setError('CSV file is empty or contains no valid data');
-        return;
-      }
-
-      setPreviewData(data);
+      loadRawText(text);
       setPreviewModalOpen(true);
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to read file');
     }
   };
 
-  const handleConfirmUpload = async (config: {
-    skipRows: number;
-    headerRow: number;
-    targetColumn: string;
-    featureColumns: string[];
-  }) => {
-    if (!selectedFile) return;
-
+  const handleConfirmUpload = () => {
     setIsLoading(true);
     setError(null);
-
-    try {
-      const result = await parseCSVFile(selectedFile);
-
-      if (result.success && result.data) {
-        // Apply user configuration to the dataset
-        const configuredDataset = {
-          ...result.data,
-          target: config.targetColumn,
-          features: config.featureColumns,
-        };
-
-        setDataset(configuredDataset);
-        setPreviewModalOpen(false);
-        setPreviewData([]);
-        setSelectedFile(null);
-        // Reset file input
-        const fileInput = document.getElementById(
-          'file-upload'
-        ) as HTMLInputElement;
-        if (fileInput) fileInput.value = '';
-      } else {
-        setError(result.error || 'Failed to parse CSV file');
-      }
-    } catch (err) {
-      setError(err instanceof Error ? err.message : 'Unknown error occurred');
-    } finally {
+    const { dataset: ds, error: err } = finalize();
+    if (err || !ds) {
+      setError(err || 'Failed to finalize dataset');
       setIsLoading(false);
+      return;
     }
+    setDataset(ds);
+    setPreviewModalOpen(false);
+    reset();
+    setSelectedFile(null);
+    const fileInput = document.getElementById(
+      'file-upload'
+    ) as HTMLInputElement;
+    if (fileInput) fileInput.value = '';
+    setIsLoading(false);
   };
 
   const handleCancelUpload = () => {
     setPreviewModalOpen(false);
-    setPreviewData([]);
+    reset();
     setSelectedFile(null);
     // Reset file input
     const fileInput = document.getElementById(
@@ -186,9 +160,16 @@ export function DatasetTab() {
         isOpen={previewModalOpen}
         onClose={handleCancelUpload}
         onConfirm={handleConfirmUpload}
-        csvData={previewData}
         fileName={selectedFile?.name || ''}
         isLoading={isLoading}
+        config={state.config}
+        preview={state.preview}
+        updateConfig={updateConfig}
+        setTarget={setTarget}
+        toggleFeature={toggleFeature}
+        setGlobalStrategy={setGlobalStrategy}
+        setColumnStrategy={setColumnStrategy}
+        setColumnConstant={setColumnConstant}
       />
     </div>
   );

@@ -1,0 +1,13 @@
+# Enforce LF line endings in repo
+* text=auto eol=lf
+
+# Treat these as binary (no EOL normalization)
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.svg text eol=lf
+*.ico binary
+
+# Lock common data/binary formats
+*.csv text eol=lf

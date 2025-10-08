@@ -10,6 +10,9 @@ export interface Dataset {
   numSamples: number;
   numFeatures: number;
   numClasses?: number;
+  // Metadata about ingestion
+  skipRows?: number; // number of initial rows skipped before header
+  headerRow?: number; // index (after skipping) of header row in original file
 }
 
 export interface ModelConfig {

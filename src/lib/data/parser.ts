@@ -1,5 +1,6 @@
 import { Dataset } from '@/store/state';
 import Papa from 'papaparse';
+import { DATA_LIMITS, LimitViolationSummary } from '@/lib/config/appConfig';
 
 export interface ParseResult {
   success: boolean;
@@ -8,9 +9,224 @@ export interface ParseResult {
 }
 
 export interface CSVParseOptions {
-  header?: boolean;
+  header?: boolean; // keep for backwards compat (if true, headerRow assumed 0 after skip)
   skipEmptyLines?: boolean;
   delimiter?: string;
+  skipRows?: number; // number of rows to skip before considering header
+  headerRow?: number; // header row index after skipping skipRows (default 0)
+  targetColumn?: string; // allow explicit target override
+  featureColumns?: string[]; // allow explicit feature override
+}
+
+// Centralized ingestion / preview types
+export type SimpleMissingStrategy =
+  | 'leave-as-is'
+  | 'drop-row'
+  | 'zero'
+  | 'mean'
+  | 'median'
+  | 'mode';
+
+export type ColumnMissingStrategy =
+  | SimpleMissingStrategy
+  | { type: 'constant'; value: string | number };
+
+export interface IngestionConfig {
+  skipRows: number;
+  headerRow: number; // relative to post-skip
+  targetColumn?: string;
+  featureColumns?: string[];
+  previewLimit?: number; // number of raw rows to keep for preview (unshifted)
+  // New strategy settings
+  globalStrategy?: SimpleMissingStrategy; // fallback when columnStrategies missing
+  columnStrategies?: Record<string, ColumnMissingStrategy>; // per-column overrides
+  treatPlaceholdersAsMissing?: boolean; // future toggle to normalize placeholder tokens to '' pre-imputation
+}
+
+export interface PreviewColumnStats {
+  missing: number; // count of missing values in preview rows (structured region only)
+  unique?: number; // unique value count (optional, can be expensive)
+  inferredType: 'numeric' | 'categorical' | 'mixed' | 'empty';
+  placeholderMissing?: number; // count of placeholder tokens treated as potential missing
+  examplePlaceholders?: string[]; // sample placeholder tokens (normalized original forms)
+  numericFraction?: number; // fraction of non-missing values that are numeric (0..1)
+}
+
+export interface PreviewResult {
+  success: boolean;
+  error?: string;
+  rawRowCount?: number;
+  headerAbsoluteIndex?: number;
+  dataStartIndex?: number;
+  columns?: string[];
+  previewRecords?: Record<string, string | number>[]; // structured preview rows (limited)
+  stats?: Record<string, PreviewColumnStats>;
+  config?: IngestionConfig;
+  cellFlags?: ('missing' | 'placeholder' | 'valid')[][]; // per preview row/column classification
+  limitErrors?: LimitViolationSummary[]; // violations of dataset size limits
+}
+
+export const defaultIngestionConfig: IngestionConfig = {
+  skipRows: 0,
+  headerRow: 0,
+  previewLimit: 50,
+};
+
+/**
+ * Generate a lightweight preview without constructing a full Dataset.
+ * Keeps the first previewLimit raw rows fixed and overlays current ingestion config.
+ */
+export function generatePreview(
+  text: string,
+  cfg: Partial<IngestionConfig>
+): PreviewResult {
+  const config: IngestionConfig = {
+    ...defaultIngestionConfig,
+    ...cfg,
+  } as IngestionConfig;
+  try {
+    const result = Papa.parse<string[]>(text, {
+      header: false,
+      skipEmptyLines: true,
+    });
+    if (result.errors.length) {
+      return {
+        success: false,
+        error: result.errors.map(e => e.message).join(', '),
+      };
+    }
+    const rows = result.data as unknown as string[][];
+    const { skipRows, headerRow, previewLimit } = config;
+    if (rows.length === 0)
+      return { success: false, error: 'No rows found', config };
+    if (skipRows >= rows.length)
+      return { success: false, error: 'skipRows >= total rows', config };
+    const headerAbs = skipRows + headerRow;
+    if (headerAbs >= rows.length)
+      return { success: false, error: 'headerRow out of range', config };
+    const headerValues = rows[headerAbs] || [];
+    // Unique column naming like final parser
+    const seen = new Map<string, number>();
+    const columns = headerValues.map(h => {
+      const base = (h ?? '').toString().trim() || 'col';
+      const count = seen.get(base) || 0;
+      seen.set(base, count + 1);
+      return count === 0 ? base : `${base}_${count}`;
+    });
+    const limitErrors: LimitViolationSummary[] = [];
+    // Structural limits first
+    if (rows.length > DATA_LIMITS.maxRows) {
+      limitErrors.push({
+        limit: 'maxRows',
+        message: `Row count ${rows.length.toLocaleString()} exceeds maximum ${DATA_LIMITS.maxRows.toLocaleString()}`,
+      });
+    }
+    if (headerValues.length > DATA_LIMITS.maxColumns) {
+      limitErrors.push({
+        limit: 'maxColumns',
+        message: `Column count ${headerValues.length} exceeds maximum ${DATA_LIMITS.maxColumns}`,
+      });
+    }
+    const previewRawRows = rows.slice(0, previewLimit);
+    const dataStartIndex = headerAbs + 1;
+    const previewRecords: Record<string, string | number>[] = [];
+    const cellFlags: ('missing' | 'placeholder' | 'valid')[][] = [];
+    // Placeholder token set (normalized lowercase)
+    const PLACEHOLDERS = new Set([
+      'na',
+      'n/a',
+      'null',
+      'none',
+      'nil',
+      'nan',
+      '?',
+      '-',
+      'missing',
+      'unknown',
+      '.',
+    ]);
+    previewRawRows.forEach(r => {
+      const obj: Record<string, string | number> = {};
+      const rowFlags: ('missing' | 'placeholder' | 'valid')[] = [];
+      columns.forEach((c, i) => {
+        const raw = r?.[i] ?? '';
+        obj[c] = raw;
+        const trimmed =
+          raw === null || raw === undefined ? '' : raw.toString().trim();
+        if (trimmed === '') rowFlags.push('missing');
+        else if (PLACEHOLDERS.has(trimmed.toLowerCase()))
+          rowFlags.push('placeholder');
+        else rowFlags.push('valid');
+      });
+      previewRecords.push(obj);
+      cellFlags.push(rowFlags);
+    });
+    // Column stats (missing + placeholders + inferred type over preview region after header)
+    const stats: Record<string, PreviewColumnStats> = {};
+    columns.forEach(col => {
+      const values: (string | number)[] = [];
+      const placeholdersEncountered: string[] = [];
+      previewRecords.forEach((rec, idx) => {
+        // Only consider rows that are candidate data rows (idx relative to raw)
+        const rawIndex = idx; // because previewRawRows starts at 0
+        if (rawIndex >= dataStartIndex) {
+          values.push(rec[col]);
+        }
+      });
+      const nonMissing = values.filter(
+        v => v !== '' && v !== null && v !== undefined
+      );
+      let placeholderCount = 0;
+      nonMissing.forEach(v => {
+        const norm = v.toString().trim().toLowerCase();
+        if (PLACEHOLDERS.has(norm)) {
+          placeholderCount++;
+          if (
+            placeholdersEncountered.length < 5 &&
+            !placeholdersEncountered.includes(norm)
+          ) {
+            placeholdersEncountered.push(norm);
+          }
+        }
+      });
+      const missingCount = values.length - nonMissing.length;
+      let inferredType: PreviewColumnStats['inferredType'] = 'empty';
+      if (values.length > 0) {
+        const numericCount = nonMissing.filter(v => {
+          const str = v.toString().trim().toLowerCase();
+          if (PLACEHOLDERS.has(str)) return false; // treat placeholders as non-numeric
+          return !isNaN(Number(v));
+        }).length;
+        if (numericCount === 0) inferredType = 'categorical';
+        else if (numericCount === nonMissing.length) inferredType = 'numeric';
+        else inferredType = 'mixed';
+      }
+      stats[col] = {
+        missing: missingCount,
+        inferredType,
+        unique: new Set(nonMissing.map(v => v.toString())).size,
+        placeholderMissing: placeholderCount,
+        examplePlaceholders: placeholdersEncountered,
+        numericFraction: nonMissing.length
+          ? nonMissing.filter(v => !isNaN(Number(v))).length / nonMissing.length
+          : undefined,
+      };
+    });
+    return {
+      success: true,
+      rawRowCount: rows.length,
+      headerAbsoluteIndex: headerAbs,
+      dataStartIndex,
+      columns,
+      previewRecords,
+      stats,
+      config,
+      cellFlags,
+      limitErrors: limitErrors.length ? limitErrors : undefined,
+    };
+  } catch (e) {
+    return { success: false, error: (e as Error).message, config };
+  }
 }
 
 /**
@@ -39,14 +255,19 @@ export function parseCSVText(
   options: CSVParseOptions = {}
 ): ParseResult {
   try {
-    const parseOptions = {
-      header: true,
-      skipEmptyLines: true,
-      delimiter: '',
-      ...options,
-    };
+    const {
+      skipRows = 0,
+      headerRow = 0,
+      targetColumn: targetOverride,
+      featureColumns: featureOverride,
+    } = options;
 
-    const result = Papa.parse(text, parseOptions);
+    // Parse raw without header so we can flexibly choose header row
+    const result = Papa.parse<string[]>(text, {
+      header: false,
+      skipEmptyLines: true,
+      delimiter: options.delimiter || '',
+    });
 
     if (result.errors.length > 0) {
       return {
@@ -55,26 +276,68 @@ export function parseCSVText(
       };
     }
 
-    const data = result.data as Record<string, string | number>[];
+    const rows = result.data as unknown as string[][];
 
-    if (data.length === 0) {
+    if (rows.length === 0) {
       return {
         success: false,
         error: 'CSV file is empty or contains no valid data',
       };
     }
 
-    // Auto-detect target column (last column by default)
-    const columns = Object.keys(data[0]);
-    const targetColumn = columns[columns.length - 1];
-    const featureColumns = columns.slice(0, -1);
+    // Apply skipRows
+    if (skipRows >= rows.length) {
+      return { success: false, error: 'skipRows exceeds total number of rows' };
+    }
+
+    const workingRows = rows.slice(skipRows);
+    if (headerRow >= workingRows.length) {
+      return {
+        success: false,
+        error: 'headerRow is out of range after skipping rows',
+      };
+    }
+
+    const header = workingRows[headerRow].map(
+      h => (h ?? '').toString().trim() || 'col'
+    );
+    // Ensure unique column names
+    const seen = new Map<string, number>();
+    const columns = header.map(col => {
+      const base = col === '' ? 'col' : col;
+      const count = seen.get(base) || 0;
+      seen.set(base, count + 1);
+      return count === 0 ? base : `${base}_${count}`;
+    });
+
+    // Data rows start after headerRow within workingRows
+    const dataStartIndex = headerRow + 1;
+    const dataSection = workingRows.slice(dataStartIndex);
+
+    // Convert to array of record objects
+    const data: Record<string, string | number>[] = dataSection.map(r => {
+      const obj: Record<string, string | number> = {};
+      columns.forEach((col, idx) => {
+        obj[col] = r[idx] ?? '';
+      });
+      return obj;
+    });
+
+    if (data.length === 0) {
+      return { success: false, error: 'No data rows found after header' };
+    }
+
+    // Determine columns, allow overrides
+    const targetColumn = targetOverride || columns[columns.length - 1];
+    const featureColumns =
+      featureOverride || columns.filter(c => c !== targetColumn);
 
     // Determine if it's classification or regression
     const targetType = inferTargetType(data, targetColumn);
 
     // Create dataset object
     const dataset: Dataset = {
-      data,
+      data: data,
       features: featureColumns,
       target: targetColumn,
       targetType,
@@ -84,6 +347,8 @@ export function parseCSVText(
         targetType === 'classification'
           ? getUniqueValues(data, targetColumn).length
           : undefined,
+      skipRows,
+      headerRow,
     };
 
     return {
@@ -97,6 +362,8 @@ export function parseCSVText(
     };
   }
 }
+
+// Legacy applyMissingValueStrategy removed; multi-strategy handled in useIngestion.finalize
 
 /**
  * Infer whether the target column is for classification or regression
